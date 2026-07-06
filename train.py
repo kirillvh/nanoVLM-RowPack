@@ -4,7 +4,6 @@ import json
 import math
 import time
 import torch
-import wandb
 import numpy
 import random
 import argparse
@@ -19,6 +18,14 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from datasets import load_dataset, concatenate_datasets, get_dataset_config_names, load_from_disk
 
+try:
+    import wandb
+except Exception as exc:
+    wandb = None
+    WANDB_IMPORT_ERROR = exc
+else:
+    WANDB_IMPORT_ERROR = None
+
 torch.manual_seed(0)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(0)
@@ -30,6 +37,8 @@ from data.collators import VQACollator
 from data.data_utils import synchronized_dataloader_step
 from data.advanced_datasets import ConstantLengthDataset
 from data.processors import get_image_processor, get_tokenizer
+from data.rowpack_datasets import RowPackNativeVQADataset
+from rowpack import RowPackBlockDataset, RowPackLoaderState
 
 import models.config as config
 from models.vision_language_model import VisionLanguageModel
@@ -116,6 +125,9 @@ def get_dataloaders(train_cfg, vlm_cfg):
     # Create datasets
     image_processor = get_image_processor(vlm_cfg.max_img_size, vlm_cfg.vit_img_size, vlm_cfg.resize_to_max_side_len)
     tokenizer = get_tokenizer(vlm_cfg.lm_tokenizer, vlm_cfg.vlm_extra_tokens, vlm_cfg.lm_chat_template)
+
+    if getattr(train_cfg, "dataset_backend", "hf") == "rowpack":
+        return get_rowpack_dataloaders(train_cfg, vlm_cfg, tokenizer, image_processor)
 
     dataset_names_to_load = train_cfg.train_dataset_name
     if "shards" in train_cfg.train_dataset_name:
@@ -244,6 +256,117 @@ def get_dataloaders(train_cfg, vlm_cfg):
 
     return train_loader, val_loader, iter_train_loader, iter_val_loader
 
+
+def get_rowpack_dataloaders(train_cfg, vlm_cfg, tokenizer, image_processor):
+    rowpack_list = train_cfg.rowpack_list_path or train_cfg.train_dataset_path
+    if not rowpack_list:
+        raise ValueError("RowPack training requires --rowpack_list or --train_dataset_path pointing to a RowPack list file")
+
+    print(f"Loading RowPack list: {rowpack_list}")
+    val_size = max(1, int(train_cfg.val_size / get_world_size()))
+    train_state = RowPackLoaderState(
+        file_index=train_cfg.rowpack_start_file_index,
+        block_index=train_cfg.rowpack_start_block_index,
+        seed=train_cfg.rowpack_seed,
+    )
+
+    train_rows = RowPackBlockDataset(
+        rowpack_list,
+        mode=train_cfg.rowpack_read_mode,
+        return_format="native_vqa" if train_cfg.rowpack_direct_vqa else "row",
+        state=train_state,
+        seed=train_cfg.rowpack_seed,
+        max_rows=train_cfg.rowpack_max_rows,
+        native_module_dir=train_cfg.rowpack_native_dir,
+        native_decode_images=train_cfg.rowpack_native_decode_images,
+    )
+    val_rows = RowPackBlockDataset(
+        rowpack_list,
+        mode="sequential",
+        return_format="native_vqa" if train_cfg.rowpack_direct_vqa else "row",
+        state=RowPackLoaderState(file_index=0, block_index=0, seed=train_cfg.rowpack_seed),
+        seed=train_cfg.rowpack_seed,
+        max_rows=val_size,
+        native_module_dir=train_cfg.rowpack_native_dir,
+        native_decode_images=train_cfg.rowpack_native_decode_images,
+    )
+
+    if not train_cfg.rowpack_direct_vqa:
+        raise NotImplementedError("NanoVLM RowPack training currently expects --rowpack_direct_vqa=true CISTA files")
+
+    train_dataset = RowPackNativeVQADataset(
+        train_rows,
+        tokenizer,
+        image_processor,
+        vlm_cfg.mp_image_token_length,
+        max_images=train_cfg.max_images_per_example,
+    )
+    val_dataset = RowPackNativeVQADataset(
+        val_rows,
+        tokenizer,
+        image_processor,
+        vlm_cfg.mp_image_token_length,
+        max_images=train_cfg.max_images_per_example,
+    )
+
+    train_dataset = ConstantLengthDataset(
+        train_dataset,
+        infinite=False,
+        max_sample_length=train_cfg.max_sample_length,
+        seq_length=vlm_cfg.lm_max_length,
+        num_of_sequences=train_cfg.batch_size * 4,
+        queue_size=8,
+        max_images_per_example=train_cfg.max_images_per_example,
+        max_images_per_knapsack=train_cfg.max_images_per_knapsack,
+    )
+    val_dataset = ConstantLengthDataset(
+        val_dataset,
+        infinite=False,
+        max_sample_length=train_cfg.max_sample_length,
+        seq_length=vlm_cfg.lm_max_length,
+        num_of_sequences=train_cfg.batch_size * 4,
+        queue_size=8,
+        max_images_per_example=train_cfg.max_images_per_example,
+        max_images_per_knapsack=train_cfg.max_images_per_knapsack,
+    )
+
+    vqa_collator = VQACollator(tokenizer, vlm_cfg.lm_max_length)
+
+    g = torch.Generator()
+    g.manual_seed(train_cfg.rowpack_seed)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=train_cfg.batch_size,
+        collate_fn=vqa_collator,
+        num_workers=train_cfg.dataloader_num_workers,
+        pin_memory=True,
+        persistent_workers=False,
+        drop_last=True,
+        worker_init_fn=seed_worker,
+        generator=g,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=train_cfg.batch_size,
+        collate_fn=vqa_collator,
+        num_workers=max(0, min(1, train_cfg.dataloader_num_workers)),
+        pin_memory=True,
+        persistent_workers=False,
+        drop_last=True,
+        worker_init_fn=seed_worker,
+        generator=g,
+    )
+
+    print("Warming up RowPack dataloaders...")
+    iter_train_loader = iter(train_loader)
+    iter_val_loader = iter(val_loader)
+    next(iter_train_loader)
+    next(iter_val_loader)
+    print("RowPack warmup complete.")
+
+    return train_loader, val_loader, iter_train_loader, iter_val_loader
+
 # Cosine learning rate schedule with warmup (from Karpathy)
 # https://github.com/karpathy/build-nanogpt/blob/master/train_gpt2.py#L353
 def get_lr(it, max_lr, max_steps):
@@ -274,7 +397,11 @@ def train(train_cfg, vlm_cfg):
 
     run_name = get_run_name(train_cfg, vlm_cfg)
     if train_cfg.log_wandb and is_master():
-        run = wandb.init(
+        if wandb is None:
+            print(f"Warning: wandb is unavailable, disabling logging. Import error: {WANDB_IMPORT_ERROR}")
+            train_cfg.log_wandb = False
+        else:
+            run = wandb.init(
             entity=train_cfg.wandb_entity,
             project="nanoVLM",
             config={
@@ -282,10 +409,10 @@ def train(train_cfg, vlm_cfg):
                 "TrainConfig": asdict(train_cfg)
             },
             name=run_name,
-        )
-        # Define a custom x-axis for lmms-eval metrics
-        lmms_eval_step = "<lmms-eval-step>"
-        run.define_metric(name="lmms_eval/*", step_metric=lmms_eval_step)
+            )
+            # Define a custom x-axis for lmms-eval metrics
+            lmms_eval_step = "<lmms-eval-step>"
+            run.define_metric(name="lmms_eval/*", step_metric=lmms_eval_step)
 
     # Initialize model
     if train_cfg.resume_from_vlm_checkpoint:
@@ -592,7 +719,7 @@ def train(train_cfg, vlm_cfg):
             data_load_start = time.time()
 
         iter_train_loader = iter(train_loader)
-        avg_train_loss = total_train_loss / i
+        avg_train_loss = total_train_loss / max(i + 1, 1)
         # gather average batch loss from all ranks if DDP
         avg_train_loss = mean(dist_gather(avg_train_loss)) if is_dist() else avg_train_loss  
 
@@ -633,6 +760,31 @@ def train(train_cfg, vlm_cfg):
             run.summary["avg_time_per_sample"] = avg_time_per_sample
             run.finish()
 
+
+def apply_tiny_debug_model_config(vlm_cfg, train_cfg):
+    vlm_cfg.vit_model_type = "testing"
+    vlm_cfg.vit_hidden_dim = 32
+    vlm_cfg.vit_inter_dim = 64
+    vlm_cfg.vit_patch_size = 16
+    vlm_cfg.vit_img_size = 64
+    vlm_cfg.vit_n_heads = 4
+    vlm_cfg.vit_n_blocks = 1
+    vlm_cfg.lm_model_type = "testing"
+    vlm_cfg.lm_hidden_dim = 64
+    vlm_cfg.lm_inter_dim = 128
+    vlm_cfg.lm_n_heads = 4
+    vlm_cfg.lm_n_kv_heads = 2
+    vlm_cfg.lm_n_blocks = 1
+    vlm_cfg.lm_max_length = min(vlm_cfg.lm_max_length, 256)
+    vlm_cfg.lm_max_position_embeddings = max(vlm_cfg.lm_max_position_embeddings, vlm_cfg.lm_max_length)
+    vlm_cfg.mp_pixel_shuffle_factor = 4
+    vlm_cfg.mp_image_token_length = 1
+    vlm_cfg.max_img_size = 64
+    vlm_cfg.resize_to_max_side_len = True
+    vlm_cfg.vlm_load_backbone_weights = False
+    vlm_cfg.hf_repo_name = None
+    train_cfg.max_sample_length = min(train_cfg.max_sample_length, vlm_cfg.lm_max_length)
+
 def main():
     global PG_CPU
     parser = argparse.ArgumentParser()
@@ -645,6 +797,29 @@ def main():
     parser.add_argument('--resume_from_vlm_checkpoint', type=bool, default=False, help='Resume training from VLM checkpoint specified by vlm_checkpoint_path (or default if not provided)')
     parser.add_argument('--no_log_wandb', action='store_true', help='Do not log to wandb')
     parser.add_argument('--train_dataset_path', type=str, help='Train dataset path')
+    parser.add_argument('--dataset_backend', choices=['hf', 'rowpack'], help='Dataset backend to use for training')
+    parser.add_argument('--rowpack_list', type=str, help='Plain text list of .rowpack files, one path per line')
+    parser.add_argument('--rowpack_native_dir', type=str, help='Optional rowpack_native build directory')
+    parser.add_argument('--rowpack_read_mode', choices=['sequential', 'shuffle', 'random'], help='RowPack block read mode')
+    parser.add_argument('--rowpack_seed', type=int, help='RowPack deterministic shuffle seed')
+    parser.add_argument('--rowpack_start_file_index', type=int, help='RowPack starting list-file line/counter')
+    parser.add_argument('--rowpack_start_block_index', type=int, help='RowPack starting block/counter')
+    parser.add_argument('--rowpack_max_rows', type=int, help='Optional maximum RowPack rows to read')
+    parser.add_argument('--dataloader_num_workers', type=int, help='Training DataLoader worker count')
+    parser.add_argument('--max_training_steps', type=int, help='Maximum training optimizer steps')
+    parser.add_argument('--batch_size', type=int, help='Per-device batch size')
+    parser.add_argument('--gradient_accumulation_steps', type=int, help='Gradient accumulation steps')
+    parser.add_argument('--val_size', type=int, help='Validation rows before train split or RowPack validation rows')
+    parser.add_argument('--lm_max_length', type=int, help='Language sequence length')
+    parser.add_argument('--max_sample_length', type=int, help='Discard samples longer than this before packing')
+    parser.add_argument('--max_img_size', type=int, help='Maximum image side length')
+    parser.add_argument('--vit_img_size', type=int, help='Image patch/split size')
+    parser.add_argument('--mp_pixel_shuffle_factor', type=int, help='Modality projector pixel shuffle factor')
+    parser.add_argument('--mp_image_token_length', type=int, help='Image token count inserted per image')
+    parser.add_argument('--no_eval', action='store_true', help='Disable in-training validation')
+    parser.add_argument('--no_lmms_eval', action='store_true', help='Disable lmms-eval job submission')
+    parser.add_argument('--no_vlm_load_backbone_weights', action='store_true', help='Initialize model randomly instead of loading HF backbones')
+    parser.add_argument('--tiny_debug_model', action='store_true', help='Use a tiny random model for local dataloader/training integration checks')
     parser.add_argument('--relevance_min_rating', type=int, help='Minimum relevance rating of images per sample')
     parser.add_argument('--image_correspondence_min_rating', type=int, help='Minimum image correspondence rating of images per sample')
     parser.add_argument('--visual_dependency_min_rating', type=int, help='Minimum visual dependency rating of images per sample')
@@ -669,6 +844,54 @@ def main():
         train_cfg.log_wandb = False
     if args.train_dataset_path is not None:
         train_cfg.train_dataset_path = args.train_dataset_path
+    if args.dataset_backend is not None:
+        train_cfg.dataset_backend = args.dataset_backend
+    if args.rowpack_list is not None:
+        train_cfg.rowpack_list_path = args.rowpack_list
+        train_cfg.dataset_backend = "rowpack"
+    if args.rowpack_native_dir is not None:
+        train_cfg.rowpack_native_dir = args.rowpack_native_dir
+    if args.rowpack_read_mode is not None:
+        train_cfg.rowpack_read_mode = args.rowpack_read_mode
+    if args.rowpack_seed is not None:
+        train_cfg.rowpack_seed = args.rowpack_seed
+    if args.rowpack_start_file_index is not None:
+        train_cfg.rowpack_start_file_index = args.rowpack_start_file_index
+    if args.rowpack_start_block_index is not None:
+        train_cfg.rowpack_start_block_index = args.rowpack_start_block_index
+    if args.rowpack_max_rows is not None:
+        train_cfg.rowpack_max_rows = args.rowpack_max_rows
+    if args.dataloader_num_workers is not None:
+        train_cfg.dataloader_num_workers = args.dataloader_num_workers
+    if args.max_training_steps is not None:
+        train_cfg.max_training_steps = args.max_training_steps
+    if args.batch_size is not None:
+        train_cfg.batch_size = args.batch_size
+    if args.gradient_accumulation_steps is not None:
+        train_cfg.gradient_accumulation_steps = args.gradient_accumulation_steps
+    if args.val_size is not None:
+        train_cfg.val_size = args.val_size
+    if args.lm_max_length is not None:
+        vlm_cfg.lm_max_length = args.lm_max_length
+        vlm_cfg.lm_max_position_embeddings = max(vlm_cfg.lm_max_position_embeddings, args.lm_max_length)
+    if args.max_sample_length is not None:
+        train_cfg.max_sample_length = args.max_sample_length
+    if args.max_img_size is not None:
+        vlm_cfg.max_img_size = args.max_img_size
+    if args.vit_img_size is not None:
+        vlm_cfg.vit_img_size = args.vit_img_size
+    if args.mp_pixel_shuffle_factor is not None:
+        vlm_cfg.mp_pixel_shuffle_factor = args.mp_pixel_shuffle_factor
+    if args.mp_image_token_length is not None:
+        vlm_cfg.mp_image_token_length = args.mp_image_token_length
+    if args.no_eval:
+        train_cfg.eval_in_epochs = False
+    if args.no_lmms_eval:
+        train_cfg.use_lmms_eval = False
+    if args.no_vlm_load_backbone_weights:
+        vlm_cfg.vlm_load_backbone_weights = False
+    if args.tiny_debug_model:
+        apply_tiny_debug_model_config(vlm_cfg, train_cfg)
     if args.relevance_min_rating is not None:
         train_cfg.relevance_min_rating = args.relevance_min_rating
     if args.image_correspondence_min_rating is not None:

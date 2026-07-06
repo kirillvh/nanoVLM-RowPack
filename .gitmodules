@@ -1,0 +1,3 @@
+[submodule "rowpack"]
+	path = rowpack
+	url = https://github.com/kirillvh/RowPack

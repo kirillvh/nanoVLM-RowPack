@@ -75,6 +75,17 @@ class TrainConfig:
     train_dataset_path: str = 'HuggingFaceM4/FineVision_concat_shuffled_2'
     train_dataset_name: tuple[str, ...] = ("default", ) #('allava_laion', 'allava_vflan', 'cambrian(filtered)_processed', 'LLaVA_Instruct_150K', 'mmevol', 'sharegpt4o', 'sharegpt4v(coco)', 'sharegpt4v(knowledge)', 'sharegpt4v(llava)', 'sharegpt4v(sam)') # 'vision_flan(filtered)', 'lvis_instruct4v',
     stream_dataset: bool = True
+    dataset_backend: str = "hf"
+    dataloader_num_workers: int = 3
+    rowpack_list_path: str | None = None
+    rowpack_native_dir: str | None = None
+    rowpack_read_mode: str = "shuffle"
+    rowpack_seed: int = 0
+    rowpack_start_file_index: int = 0
+    rowpack_start_block_index: int = 0
+    rowpack_max_rows: int | None = None
+    rowpack_direct_vqa: bool = True
+    rowpack_native_decode_images: bool = False
     relevance_min_rating: int = 1
     image_correspondence_min_rating: int = 1
     visual_dependency_min_rating: int = 1

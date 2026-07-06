@@ -14,6 +14,18 @@ def get_tokenizer(name, extra_special_tokens=None, chat_template=None):
             tokenizer_init_kwargs["chat_template"] = chat_template
         tokenizer = AutoTokenizer.from_pretrained(name, **tokenizer_init_kwargs,)
         tokenizer.pad_token = tokenizer.eos_token
+        if extra_special_tokens is not None:
+            vocab = tokenizer.get_vocab()
+            missing_tokens = [
+                token for token in extra_special_tokens.values()
+                if token not in vocab
+            ]
+            if missing_tokens:
+                tokenizer.add_special_tokens({"additional_special_tokens": list(extra_special_tokens.values())})
+
+            for attr_name, token in extra_special_tokens.items():
+                setattr(tokenizer, attr_name, token)
+                setattr(tokenizer, f"{attr_name}_id", tokenizer.convert_tokens_to_ids(token))
         TOKENIZERS_CACHE[name] = tokenizer
     return TOKENIZERS_CACHE[name]
 
