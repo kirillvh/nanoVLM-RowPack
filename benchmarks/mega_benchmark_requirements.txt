@@ -1,0 +1,11 @@
+torch<3
+numpy<3
+torchvision
+pillow
+datasets>=3.5.0
+huggingface-hub
+transformers
+safetensors
+einops
+pyarrow
+matplotlib
